@@ -1,0 +1,193 @@
+name: Build & Release ZCode Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------
+  # 读取 ZCode 版本
+  # ------------------------------------------------------------
+  version:
+    name: Read version
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version from package.json
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+          echo "ZCode version: $VERSION"
+          echo "Release tag: v$VERSION"
+
+  # ------------------------------------------------------------
+  # 构建三个平台
+  # ------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.name }}
+    needs: version
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: win-x64
+            runner: windows-2025
+            os: win
+            arch: x64
+
+          - name: mac-x64
+            runner: macos-15-intel
+            os: mac
+            arch: x64
+
+          - name: mac-arm64
+            runner: macos-15
+            os: mac
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup pnpm
+        run: corepack prepare pnpm@10.33.2 --activate
+
+      - name: Show environment
+        shell: bash
+        run: |
+          echo "Platform: ${{ matrix.os }}"
+          echo "Architecture: ${{ matrix.arch }}"
+          node --version
+          pnpm --version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build ZCode Desktop
+        run: pnpm bundle:desktop -- --os ${{ matrix.os }} --arch ${{ matrix.arch }}
+
+      - name: List build output
+        shell: bash
+        run: |
+          echo "===== Build output ====="
+          find packages/desktop/dist -maxdepth 3 -type f -print || true
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          mkdir -p release-files
+
+          if [ "${{ matrix.os }}" = "win" ]; then
+            find packages/desktop/dist \
+              -maxdepth 2 \
+              -type f \
+              \( -name "*.exe" -o -name "*.zip" \) \
+              -exec cp {} release-files/ \;
+          else
+            find packages/desktop/dist \
+              -maxdepth 2 \
+              -type f \
+              \( -name "*.dmg" -o -name "*.zip" \) \
+              -exec cp {} release-files/ \;
+          fi
+
+          echo "===== Release files ====="
+          find release-files -type f -print
+
+          if [ -z "$(find release-files -type f -print -quit)" ]; then
+            echo "No release files found."
+            exit 1
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZCode-${{ matrix.name }}
+          path: release-files/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ------------------------------------------------------------
+  # 汇总三个平台并创建 Release
+  # ------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+
+    needs:
+      - version
+      - build
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Show release assets
+        shell: bash
+        run: |
+          echo "===== Release assets ====="
+          find release-assets -type f -print
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+          else
+            gh release create "$TAG" \
+              --target "${{ github.sha }}" \
+              --title "ZCode $VERSION" \
+              --notes "Unofficial builds generated from the ZCode open-source repository.
+
+          Platforms:
+          - Windows x64
+          - macOS x64 (Intel)
+          - macOS arm64 (Apple Silicon)
+
+          Source commit: ${{ github.sha }}"
+          fi
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: bash
+        run: |
+          find release-assets -type f -print0 | while IFS= read -r -d '' file; do
+            echo "Uploading: $file"
+            gh release upload "$TAG" "$file" --clobber
+          done
